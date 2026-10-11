@@ -1,0 +1,24 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kueue-controller-manager
+  namespace: gpu-observability
+  labels:
+    app.kubernetes.io/part-of: gpu-observability
+spec:
+  namespaceSelector:
+    matchNames:
+      - gpustack-system
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: metrics-service
+      app.kubernetes.io/name: kueue
+  endpoints:
+    - port: https
+      scheme: https
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+      tlsConfig:
+        insecureSkipVerify: true

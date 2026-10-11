@@ -1,0 +1,607 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-feishu-adapter
+  namespace: gpu-observability
+data:
+  adapter.py: |
+    import base64
+    import hashlib
+    import hmac
+    import json
+    import os
+    import time
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import datetime, timedelta, timezone
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    LISTEN_PORT = 8080
+    MAX_BODY_BYTES = 1024 * 1024
+    MAX_ALERTS = 20
+    MAX_MESSAGE_CHARS = 28000
+    BEIJING_TIMEZONE = timezone(timedelta(hours=8))
+    PROMETHEUS_URL = os.environ.get(
+        "PROMETHEUS_URL",
+        "http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090",
+    ).rstrip("/")
+
+    ALERT_NAMES = {
+        "GPUStackWorkerMetricsDown": "GPUStack Worker 指标不可用",
+        "GPUStackWorkerDiscoveryMissing": "GPUStack Worker 发现异常",
+        "GPUStackServerMetricsDown": "GPUStack Server 指标不可用",
+        "GPUStackWorkerRootFilesystemHigh": "GPUStack Worker 根分区使用率过高",
+        "GPUStackGPUHighTemperature": "GPUStack GPU 温度过高",
+        "GPUStackModelInstanceLoaded": "GPUStack 模型实例已加载",
+        "GPUStackRequestErrors": "GPUStack 请求失败",
+        "GPUStackRequestQueueBacklog": "GPUStack 请求持续排队",
+        "GPUStackUnattributedWorkerUse": "GPUStack GPU 使用未归属",
+        "DCGMExporterDown": "DCGM Exporter 不可用",
+        "GPUXIDError": "NVIDIA GPU XID 错误",
+        "GPUHealthWarning": "GPU 健康检查异常",
+        "DCGMGPUHighTemperature": "GPU 温度超过阈值",
+        "DCGMGPUMemoryNearlyFull": "GPU 显存接近耗尽",
+        "GPUResourceInUse": "GPU 资源正在使用",
+        "GPUHostUseUnattributed": "GPU 主机侧占用未归属",
+        "GPUAllocatedButIdle": "已分配 GPU 长时间空闲",
+        "GPUDoubleBitECCError": "GPU 双比特 ECC 错误",
+        "KubernetesGPUAllocationActive": "Kubernetes GPU 分配已生效",
+        "KueueMetricsMissing": "Kueue 指标缺失",
+        "KueueWorkloadsPending": "Kueue 工作负载持续排队",
+        "KueueWorkloadEvicted": "Kueue 工作负载被驱逐",
+        "GPUTrainingStalled": "GPU 训练进度停滞",
+        "GPUTrainingCompleted": "GPU 训练完成",
+        "GPUProcessExporterDown": "GPU 进程采集器不可用",
+        "GPUProcessStarted": "GPU 任务进程生命周期",
+        "GPUProcessLongRunning": "GPU 任务进程运行超过 5 小时",
+        "FeishuDeliveryTest": "飞书告警链路测试",
+    }
+
+    STATUS_NAMES = {
+        "FIRING": "已触发",
+        "RESOLVED": "已恢复",
+        "UNKNOWN": "状态未知",
+    }
+
+    SEVERITY_NAMES = {
+        "critical": "严重",
+        "warning": "警告",
+        "info": "信息",
+        "none": "无",
+        "unknown": "未知",
+    }
+
+    CATEGORY_NAMES = {
+        "availability": "可用性",
+        "capacity": "容量",
+        "hardware": "硬件",
+        "resource_state": "资源状态",
+        "workload": "工作负载",
+        "ownership": "归属",
+        "efficiency": "使用效率",
+        "scheduling": "调度",
+        "test": "测试",
+    }
+
+    EVENT_NAMES = {
+        "allocated": "资源已分配",
+        "completed": "任务已完成",
+        "started": "进程已启动",
+        "long_running": "运行时间过长",
+    }
+
+
+    def first_value(mapping, keys):
+        for key in keys:
+            value = mapping.get(key)
+            if value:
+                return str(value)
+        return ""
+
+
+    def translated(mapping, value, default="未知"):
+        if not value:
+            return default
+        return mapping.get(str(value).lower(), mapping.get(str(value).upper(), str(value)))
+
+
+    def alert_title(name, status=""):
+        if name == "GPUProcessStarted":
+            # 图标让开始/结束在消息列表里一眼可分
+            if str(status).upper() == "RESOLVED":
+                return "🔴 GPU 任务进程已结束"
+            return "🟢 GPU 任务进程已开始"
+        return ALERT_NAMES.get(name, name or "GPU 监控告警")
+
+    def lifecycle_header(name, alerts, status):
+        """消息首行横幅。任务开始/结束几乎同时到达时，首行即说明本条属于哪一类：
+        全部触发=开始，全部恢复=结束，两者混合（旧进程结束、新进程启动被分进同
+        一通知）=切换。"""
+        statuses = [str(alert.get("status", status)).upper() for alert in alerts or []]
+        if name == "GPUProcessStarted" and statuses:
+            if all(s == "FIRING" for s in statuses):
+                return "【GPU 任务·开始 🟢】GPU 任务进程已开始"
+            if all(s == "RESOLVED" for s in statuses):
+                return "【GPU 任务·结束 🔴】GPU 任务进程已结束"
+            return "【GPU 任务·切换 🔄】GPU 任务进程已结束并已开始新进程"
+        return f"【GPU 告警·{translated(STATUS_NAMES, status)}】{alert_title(name, status)}"
+
+
+    def beijing_time(value):
+        if not value:
+            return ""
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            return parsed.astimezone(BEIJING_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return str(value)
+
+
+    def format_capacity(value):
+        return f"{value / (1024 ** 3):.1f} GiB"
+
+
+    def format_duration(seconds):
+        seconds = max(0, int(seconds))
+        days, remainder = divmod(seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes = remainder // 60
+        parts = []
+        if days:
+            parts.append(f"{days} 天")
+        if hours or days:
+            parts.append(f"{hours} 小时")
+        parts.append(f"{minutes} 分钟")
+        return " ".join(parts)
+
+
+    def prometheus_result(query):
+        url = f"{PROMETHEUS_URL}/api/v1/query?{urllib.parse.urlencode({'query': query})}"
+        with urllib.request.urlopen(url, timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return payload.get("data", {}).get("result", [])
+
+
+    def prometheus_value(query):
+        results = prometheus_result(query)
+        if not results:
+            return None
+        return float(results[0]["value"][1])
+
+
+    def resource_snapshot(labels):
+        node = first_value(labels, ("node", "worker_name"))
+        if not node:
+            return []
+
+        gpu = first_value(labels, ("gpu", "gpu_index"))
+        node_literal = json.dumps(node)
+        gpu_matcher = f",gpu={json.dumps(gpu)}" if gpu and gpu != "unknown" else ""
+        gpu_selector = f'node={node_literal}{gpu_matcher}'
+        pod_info = (
+            "max by (namespace,pod,node) "
+            f"(kube_pod_info{{node={node_literal}}})"
+        )
+        join = f"* on(namespace,pod) group_left(node) ({pod_info})"
+
+        queries = {
+            "gpu_free": f"sum(DCGM_FI_DEV_FB_FREE{{{gpu_selector}}})",
+            "gpu_used": f"sum(DCGM_FI_DEV_FB_USED{{{gpu_selector}}})",
+            "gpu_util": f"max(DCGM_FI_DEV_GPU_UTIL{{{gpu_selector}}})",
+            "gpu_temp": f"max(DCGM_FI_DEV_GPU_TEMP{{{gpu_selector}}})",
+            "memory_available": (
+                'sum(node_memory_MemAvailable_bytes{job="node-exporter"} '
+                f"{join})"
+            ),
+            "memory_total": (
+                'sum(node_memory_MemTotal_bytes{job="node-exporter"} '
+                f"{join})"
+            ),
+            "disk_available": (
+                'sum(node_filesystem_avail_bytes{job="node-exporter",mountpoint="/"} '
+                f"{join})"
+            ),
+            "disk_total": (
+                'sum(node_filesystem_size_bytes{job="node-exporter",mountpoint="/"} '
+                f"{join})"
+            ),
+        }
+
+        values = {}
+        with ThreadPoolExecutor(max_workers=len(queries)) as executor:
+            futures = {
+                key: executor.submit(prometheus_value, query)
+                for key, query in queries.items()
+            }
+            for key, future in futures.items():
+                try:
+                    values[key] = future.result()
+                except (OSError, ValueError, KeyError, urllib.error.URLError):
+                    values[key] = None
+
+        lines = []
+        gpu_free = values.get("gpu_free")
+        gpu_used = values.get("gpu_used")
+        if gpu_free is not None and gpu_used is not None:
+            lines.append(
+                f"GPU 剩余显存：{gpu_free / 1024:.1f} GiB / "
+                f"{(gpu_free + gpu_used) / 1024:.1f} GiB"
+            )
+        if values.get("gpu_util") is not None:
+            gpu_status = f"GPU 利用率：{values['gpu_util']:.0f}%"
+            if values.get("gpu_temp") is not None:
+                gpu_status += f"，温度：{values['gpu_temp']:.0f} C"
+            lines.append(gpu_status)
+
+        memory_available = values.get("memory_available")
+        memory_total = values.get("memory_total")
+        if memory_available is not None and memory_total is not None:
+            lines.append(
+                f"主机剩余内存：{format_capacity(memory_available)} / "
+                f"{format_capacity(memory_total)}"
+            )
+
+        disk_available = values.get("disk_available")
+        disk_total = values.get("disk_total")
+        if disk_available is not None and disk_total is not None:
+            lines.append(
+                f"根分区剩余空间：{format_capacity(disk_available)} / "
+                f"{format_capacity(disk_total)}"
+            )
+
+        if not lines:
+            return []
+        return ["资源余量（发送时）：", *lines]
+
+
+    def lifecycle_summary(name, status, labels):
+        if name != "GPUProcessStarted":
+            return ""
+        owner = labels.get("owner", "未知用户")
+        task = labels.get("task", labels.get("process", "未知任务"))
+        action = "已结束" if status == "RESOLVED" else "已开始运行"
+        return f"用户 {owner} 的任务进程 {task} {action}"
+
+    def lifecycle_continuation(name, alert_status, labels):
+        """任务结束通知里提示同任务的新进程是否已在运行。
+
+        有些任务结束后会立刻启动下一个同名任务，“已结束”与“已开始”两条通知
+        几乎同时到达。这里实时查一下 Prometheus：若同节点同任务已有别的 PID
+        在跑，就在结束通知里明确指出本条对应旧进程，随后的开始通知属于新进程。
+        """
+        if name != "GPUProcessStarted" or alert_status != "RESOLVED":
+            return ""
+        node = labels.get("node")
+        task = labels.get("task") or labels.get("process")
+        ended_pid = labels.get("pid")
+        if not node or not task:
+            return ""
+        query = (
+            "group by (pid) (gpu_process_used_memory_mib"
+            f'{{scope="host",node={json.dumps(node)},task={json.dumps(task)}}})'
+        )
+        try:
+            results = prometheus_result(query)
+        except (OSError, ValueError, KeyError, urllib.error.URLError):
+            return ""
+        running_pids = sorted(
+            result["metric"]["pid"]
+            for result in results
+            if result.get("metric", {}).get("pid")
+            and result["metric"]["pid"] != ended_pid
+        )
+        if not running_pids:
+            return ""
+        return (
+            f"提示：同任务已有新进程 PID {'、'.join(running_pids)} 正在运行，"
+            f"本条“已结束”对应上一个进程（PID {ended_pid}）；"
+            "紧随其后的“已开始”通知属于新进程，两条消息请以 PID 区分。"
+        )
+
+
+    def build_message(event):
+        status = str(event.get("status", "unknown")).upper()
+        common = event.get("commonLabels") or {}
+        common_name = common.get("alertname", "")
+        alerts = event.get("alerts") or []
+        lines = [
+            lifecycle_header(common_name, alerts, status),
+            f"集群：{common.get('cluster', 'gpustack-rke2')}",
+        ]
+
+        snapshots = {}
+        for index, alert in enumerate(alerts[:MAX_ALERTS], start=1):
+            labels = alert.get("labels") or {}
+            annotations = alert.get("annotations") or {}
+            alert_status = str(alert.get("status", status)).upper()
+            name = labels.get("alertname", "")
+            severity = labels.get("severity", "unknown")
+            category = labels.get("category", "")
+            lines.extend(
+                [
+                    "",
+                    f"{index}. {alert_title(name, alert_status)}",
+                    f"状态：{translated(STATUS_NAMES, alert_status)} | "
+                    f"级别：{translated(SEVERITY_NAMES, severity)}",
+                    f"告警代码：{name or '未命名告警'}",
+                ]
+            )
+            if category:
+                lines.append(f"类别：{translated(CATEGORY_NAMES, category)}")
+
+            identity_fields = (
+                ("节点", ("node", "worker_name", "instance")),
+                ("命名空间", ("namespace",)),
+                ("Pod", ("pod",)),
+                ("容器", ("container",)),
+                ("GPU", ("gpu", "gpu_index", "device")),
+                ("GPU UUID", ("gpu_uuid", "UUID")),
+                ("GPU 型号", ("modelName", "gpu_name")),
+                ("进程", ("process",)),
+                ("PID", ("pid",)),
+                ("模型", ("model_name",)),
+                ("模型实例", ("model_instance_name",)),
+                ("负责人", ("label_observability_gpustack_io_owner", "owner")),
+                ("团队", ("label_observability_gpustack_io_team", "team")),
+                ("项目", ("label_observability_gpustack_io_project", "project")),
+                ("任务", ("label_observability_gpustack_io_task", "task")),
+            )
+            for label, keys in identity_fields:
+                if name in ("GPUProcessStarted", "GPUProcessLongRunning") and label in (
+                    "命名空间",
+                    "Pod",
+                    "容器",
+                ):
+                    continue
+                value = first_value(labels, keys)
+                if value:
+                    lines.append(f"{label}：{value}")
+
+            event_name = labels.get("event")
+            if event_name:
+                event_text = translated(EVENT_NAMES, event_name)
+                if name == "GPUProcessStarted" and alert_status == "RESOLVED":
+                    event_text = "进程已结束"
+                lines.append(f"事件：{event_text}")
+
+            summary = lifecycle_summary(name, alert_status, labels)
+            if not summary:
+                summary = first_value(annotations, ("summary", "message"))
+            description = annotations.get("description")
+            if summary:
+                lines.append(f"摘要：{summary}")
+            if description and description != summary:
+                lines.append(f"详情：{description}")
+
+            started_at = alert.get("startsAt")
+            ended_at = alert.get("endsAt")
+            if started_at:
+                lines.append(f"触发时间（北京时间）：{beijing_time(started_at)}")
+            if alert_status == "RESOLVED" and ended_at:
+                lines.append(f"恢复时间（北京时间）：{beijing_time(ended_at)}")
+
+            process_start = labels.get("process_start_unix")
+            if process_start and process_start != "0":
+                try:
+                    started = datetime.fromtimestamp(
+                        int(process_start), tz=timezone.utc
+                    )
+                    lines.append(
+                        "进程启动时间（北京时间）："
+                        f"{started.astimezone(BEIJING_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
+                    reference = datetime.now(timezone.utc)
+                    if alert_status == "RESOLVED" and ended_at:
+                        reference = datetime.fromisoformat(
+                            str(ended_at).replace("Z", "+00:00")
+                        )
+                    lines.append(
+                        f"进程运行时长：{format_duration((reference - started).total_seconds())}"
+                    )
+                except (ValueError, OverflowError):
+                    pass
+
+            continuation = lifecycle_continuation(name, alert_status, labels)
+            if continuation:
+                lines.append(continuation)
+
+            snapshot_key = (
+                first_value(labels, ("node", "worker_name")),
+                first_value(labels, ("gpu", "gpu_index")),
+            )
+            if snapshot_key not in snapshots:
+                snapshots[snapshot_key] = resource_snapshot(labels)
+            lines.extend(snapshots[snapshot_key])
+
+        if len(alerts) > MAX_ALERTS:
+            lines.extend(["", f"另有 {len(alerts) - MAX_ALERTS} 条告警未展开"])
+
+        return "\n".join(lines)[:MAX_MESSAGE_CHARS]
+
+
+    def feishu_payload(message):
+        payload = {
+            "msg_type": "text",
+            "content": {"text": message},
+        }
+        secret = os.environ.get("FEISHU_SIGNING_SECRET", "").strip()
+        if secret:
+            timestamp = str(int(time.time()))
+            string_to_sign = f"{timestamp}\n{secret}"
+            signature = hmac.new(
+                string_to_sign.encode("utf-8"),
+                b"",
+                hashlib.sha256,
+            ).digest()
+            payload["timestamp"] = timestamp
+            payload["sign"] = base64.b64encode(signature).decode("ascii")
+        return payload
+
+
+    def post_to_feishu(event):
+        webhook_url = os.environ["FEISHU_WEBHOOK_URL"]
+        body = json.dumps(feishu_payload(build_message(event))).encode("utf-8")
+        request = urllib.request.Request(
+            webhook_url,
+            data=body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response_body = response.read().decode("utf-8")
+        result = json.loads(response_body) if response_body else {}
+        result_code = result.get("code", result.get("StatusCode", 0))
+        if result_code != 0:
+            raise RuntimeError(f"Feishu returned code {result_code}")
+
+
+    class Handler(BaseHTTPRequestHandler):
+        def send_text(self, status, text):
+            body = text.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/healthz":
+                self.send_text(200, "ok")
+                return
+            self.send_text(404, "not found")
+
+        def do_POST(self):
+            if self.path != "/alerts":
+                self.send_text(404, "not found")
+                return
+
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+                if content_length <= 0 or content_length > MAX_BODY_BYTES:
+                    self.send_text(413, "invalid request size")
+                    return
+                event = json.loads(self.rfile.read(content_length))
+                post_to_feishu(event)
+                self.send_text(200, "ok")
+            except (json.JSONDecodeError, KeyError, ValueError) as error:
+                print(f"invalid request: {error}", flush=True)
+                self.send_text(400, "invalid request")
+            except (urllib.error.URLError, RuntimeError) as error:
+                print(f"delivery failed: {error}", flush=True)
+                self.send_text(502, "delivery failed")
+            except Exception as error:
+                print(f"unexpected error: {type(error).__name__}: {error}", flush=True)
+                self.send_text(500, "internal error")
+
+        def log_message(self, format_string, *args):
+            print(f"{self.client_address[0]} - {format_string % args}", flush=True)
+
+
+    if __name__ == "__main__":
+        ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager-feishu-adapter
+  namespace: gpu-observability
+  labels:
+    app.kubernetes.io/name: alertmanager-feishu-adapter
+    app.kubernetes.io/part-of: gpu-observability
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: alertmanager-feishu-adapter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: alertmanager-feishu-adapter
+        app.kubernetes.io/part-of: gpu-observability
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: adapter
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - /app/adapter.py
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: FEISHU_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: feishu-gpu-alerts
+                  key: webhook-url
+            - name: FEISHU_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: feishu-gpu-alerts
+                  key: signing-secret
+                  optional: true
+            - name: PROMETHEUS_URL
+              value: http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: application
+              mountPath: /app
+              readOnly: true
+      volumes:
+        - name: application
+          configMap:
+            name: alertmanager-feishu-adapter
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager-feishu-adapter
+  namespace: gpu-observability
+  labels:
+    app.kubernetes.io/name: alertmanager-feishu-adapter
+    app.kubernetes.io/part-of: gpu-observability
+spec:
+  selector:
+    app.kubernetes.io/name: alertmanager-feishu-adapter
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

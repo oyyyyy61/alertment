@@ -1,0 +1,28 @@
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: gpu-alerts
+  namespace: gpu-observability
+  labels:
+    observability.gpustack.io/receiver: gpu-alerts
+spec:
+  route:
+    receiver: gpu-webhook
+    groupBy:
+      - alertname
+      - cluster
+      - node
+      - worker_name
+      - namespace
+      - pod
+    groupWait: 10s
+    groupInterval: 1m
+    repeatInterval: 4h
+  receivers:
+    - name: gpu-webhook
+      webhookConfigs:
+        - sendResolved: true
+          urlSecret:
+            name: gpu-alert-webhook
+            key: url
+          maxAlerts: 20

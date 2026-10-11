@@ -1,0 +1,43 @@
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: gpustack-server
+  namespace: gpu-observability
+  labels:
+    app.kubernetes.io/part-of: gpu-observability
+spec:
+  namespaceSelector:
+    matchNames:
+      - gpustack-system
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gpustack-chart
+      app.kubernetes.io/instance: gpustack
+  endpoints:
+    - port: metrics
+      interval: 15s
+      scrapeTimeout: 10s
+      path: /metrics
+      relabelings:
+        - sourceLabels:
+            - __meta_kubernetes_service_name
+          regex: gpustack-server-cluster-ip
+          action: keep
+        - targetLabel: job
+          replacement: gpustack-server
+---
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: gpustack-worker-discovery
+  namespace: gpu-observability
+  labels:
+    app.kubernetes.io/part-of: gpu-observability
+spec:
+  jobName: gpustack-worker-discovery
+  scrapeInterval: 15s
+  scrapeTimeout: 10s
+  metricsPath: /metrics
+  httpSDConfigs:
+    - url: http://gpustack-server-cluster-ip.gpustack-system.svc.cluster.local:10161/metrics/targets
+      refreshInterval: 1m

@@ -1,0 +1,61 @@
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: gpu-alerts-feishu
+  namespace: gpu-observability
+  labels:
+    observability.gpustack.io/receiver: gpu-alerts
+spec:
+  route:
+    receiver: feishu
+    matchers:
+      - name: category
+        value: .+
+        matchType: =~
+    groupBy:
+      - alertname
+      - cluster
+      - node
+      - worker_name
+      - namespace
+      - pod
+    groupWait: 10s
+    groupInterval: 1m
+    repeatInterval: 4h
+    routes:
+      - receiver: feishu
+        matchers:
+          - name: alertname
+            value: GPUProcessStarted
+            matchType: "="
+        groupBy:
+          - alertname
+          - cluster
+          - node
+          - owner
+          - task
+          - pid
+        groupWait: 0s
+        groupInterval: 30s
+        repeatInterval: 24h
+      - receiver: feishu
+        matchers:
+          - name: alertname
+            value: GPUProcessLongRunning
+            matchType: "="
+        groupBy:
+          - alertname
+          - cluster
+          - node
+          - owner
+          - task
+          - pid
+        groupWait: 0s
+        groupInterval: 1m
+        repeatInterval: 5h
+  receivers:
+    - name: feishu
+      webhookConfigs:
+        - sendResolved: true
+          url: http://alertmanager-feishu-adapter.gpu-observability.svc.cluster.local:8080/alerts
+          maxAlerts: 20

@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - gpustack-workers.yaml
+  - gpu-process-exporter.yaml
+  - training-progress-podmonitor.yaml
+  - kueue-servicemonitor.yaml
+  - prometheus-rules.yaml
+  - grafana-dashboard.yaml

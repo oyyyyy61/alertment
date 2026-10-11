@@ -1,0 +1,91 @@
+fullnameOverride: dcgm-exporter
+runtimeClassName: nvidia
+hostPID: true
+
+serviceMonitor:
+  enabled: true
+  interval: 15s
+  scrapeTimeout: 10s
+  additionalLabels:
+    observability.gpustack.io/component: gpu
+  relabelings:
+    - sourceLabels:
+        - __meta_kubernetes_pod_node_name
+      targetLabel: node
+    - sourceLabels:
+        - __meta_kubernetes_namespace
+      targetLabel: exporter_namespace
+    - sourceLabels:
+        - __meta_kubernetes_pod_name
+      targetLabel: exporter_pod
+    - sourceLabels:
+        - __meta_kubernetes_pod_container_name
+      targetLabel: exporter_container
+    - action: labeldrop
+      regex: namespace|pod|container
+
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values:
+                - gpu-node-14
+                - gpu-node-15
+
+kubernetes:
+  enablePodLabels: true
+  enablePodUID: true
+  podLabelAllowlistRegex:
+    - ^observability\.gpustack\.io/(owner|team|project|task)$
+    - ^kueue\.x-k8s\.io/queue-name$
+  rbac:
+    create: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# This complete list includes the normal telemetry plus error/health metrics.
+# Unsupported fields on GeForce cards are skipped by DCGM Exporter.
+customMetrics: |
+  DCGM_FI_DEV_SM_CLOCK, gauge, SM clock frequency in MHz.
+  DCGM_FI_DEV_MEM_CLOCK, gauge, Memory clock frequency in MHz.
+  DCGM_FI_DEV_MEMORY_TEMP, gauge, Memory temperature in C.
+  DCGM_FI_DEV_GPU_TEMP, gauge, GPU temperature in C.
+  DCGM_FI_DEV_POWER_USAGE, gauge, Power draw in W.
+  DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION, counter, Total energy consumption in mJ.
+  DCGM_FI_DEV_PCIE_REPLAY_COUNTER, counter, Total PCIe retries.
+  DCGM_FI_DEV_GPU_UTIL, gauge, GPU utilization in percent.
+  DCGM_FI_DEV_MEM_COPY_UTIL, gauge, Memory utilization in percent.
+  DCGM_FI_DEV_ENC_UTIL, gauge, Encoder utilization in percent.
+  DCGM_FI_DEV_DEC_UTIL, gauge, Decoder utilization in percent.
+  DCGM_FI_DEV_XID_ERRORS, gauge, Last XID error.
+  DCGM_EXP_XID_ERRORS_COUNT, gauge, XID errors in the configured window.
+  DCGM_EXP_XID_ERRORS_TOTAL, counter, XID errors since exporter start.
+  DCGM_EXP_CLOCK_EVENTS_COUNT, gauge, Clock events in the configured window.
+  DCGM_EXP_CLOCK_EVENTS_TOTAL, counter, Clock events since exporter start.
+  DCGM_EXP_GPU_HEALTH_STATUS, gauge, Current DCGM GPU health status.
+  DCGM_FI_DEV_POWER_VIOLATION, counter, Power throttling duration in ns.
+  DCGM_FI_DEV_THERMAL_VIOLATION, counter, Thermal throttling duration in ns.
+  DCGM_FI_DEV_RELIABILITY_VIOLATION, counter, Reliability throttling duration in ns.
+  DCGM_FI_DEV_FB_FREE, gauge, Framebuffer memory free in MiB.
+  DCGM_FI_DEV_FB_USED, gauge, Framebuffer memory used in MiB.
+  DCGM_FI_DEV_FB_RESERVED, gauge, Framebuffer memory reserved in MiB.
+  DCGM_FI_DEV_ECC_SBE_VOL_TOTAL, counter, Volatile single-bit ECC errors.
+  DCGM_FI_DEV_ECC_DBE_VOL_TOTAL, counter, Volatile double-bit ECC errors.
+  DCGM_FI_DEV_ECC_SBE_AGG_TOTAL, counter, Persistent single-bit ECC errors.
+  DCGM_FI_DEV_ECC_DBE_AGG_TOTAL, counter, Persistent double-bit ECC errors.
+  DCGM_FI_DEV_RETIRED_SBE, counter, Pages retired for single-bit errors.
+  DCGM_FI_DEV_RETIRED_DBE, counter, Pages retired for double-bit errors.
+  DCGM_FI_DEV_RETIRED_PENDING, gauge, Pages pending retirement.
+  DCGM_FI_DEV_UNCORRECTABLE_REMAPPED_ROWS, counter, Uncorrectable remapped rows.
+  DCGM_FI_DEV_CORRECTABLE_REMAPPED_ROWS, counter, Correctable remapped rows.
+  DCGM_FI_DEV_ROW_REMAP_FAILURE, gauge, Row remapping failure state.
+  DCGM_FI_DRIVER_VERSION, label, Driver version.

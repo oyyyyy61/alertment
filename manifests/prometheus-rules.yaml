@@ -1,0 +1,356 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: gpu-resource-management
+  namespace: gpu-observability
+  labels:
+    app.kubernetes.io/part-of: gpu-observability
+spec:
+  groups:
+    - name: gpustack.worker
+      rules:
+        - alert: GPUStackWorkerMetricsDown
+          expr: up{job="gpustack-worker-discovery"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            category: availability
+          annotations:
+            summary: "{{ $labels.node }} 上的 GPUStack Worker 指标不可用"
+            description: "Prometheus 已连续 2 分钟无法采集 {{ $labels.instance }}。请检查 Worker Pod、节点网络和 10151 端口。"
+
+        - alert: GPUStackWorkerDiscoveryMissing
+          expr: absent(up{job="gpustack-worker-discovery"})
+          for: 5m
+          labels:
+            severity: critical
+            category: availability
+          annotations:
+            summary: "GPUStack Worker 发现未返回任何目标"
+            description: "请检查 GPUStack Server 的 10161 端口和 /metrics/targets 指标接口。"
+
+        - alert: GPUStackServerMetricsDown
+          expr: up{job="gpustack-server"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            category: availability
+          annotations:
+            summary: "GPUStack Server 指标不可用"
+            description: "Prometheus 无法采集 gpustack-system/gpustack-server-cluster-ip 的指标端口。"
+
+        - alert: GPUStackWorkerRootFilesystemHigh
+          expr: gpustack:worker_node_filesystem_utilization_rate{mountpoint="/"} > 95
+          for: 10m
+          labels:
+            severity: warning
+            category: capacity
+          annotations:
+            summary: "{{ $labels.worker_name }} 的根分区使用率过高"
+            description: "根分区使用率为 {{ $value | printf \"%.1f\" }}%，可能继续引发 DiskPressure 和 Worker 任务驱逐。"
+
+        - alert: GPUStackGPUHighTemperature
+          expr: gpustack:worker_node_gpu_temperature_celsius > 82
+          for: 5m
+          labels:
+            severity: warning
+            category: hardware
+          annotations:
+            summary: "{{ $labels.worker_name }} 的 GPU 温度过高"
+            description: "{{ $labels.gpu_name }} GPU {{ $labels.gpu_index }} 当前温度为 {{ $value | printf \"%.0f\" }} C。"
+
+        - alert: GPUStackModelInstanceLoaded
+          # GPUStack Worker 在实例停止后仍会保留 value=0 的
+          # gpustack:num_requests_running 残留序列，仅凭该序列存在会误报。
+          # 因此叠加 Server 端 gpustack:model_running_instances 门控：
+          # 只有 GPUStack 确认该模型确有运行中实例时才触发，
+          # 模型停止/暂停后告警恢复，重新启动后才再次告警。
+          expr: |
+            count by (worker_name, model_name, model_instance_name, runtime) (
+              gpustack:num_requests_running
+            ) > 0
+            and on (model_name)
+            max by (model_name) (gpustack:model_running_instances) >= 1
+          for: 1m
+          labels:
+            severity: info
+            category: resource_state
+            event: allocated
+          annotations:
+            summary: "GPUStack 模型实例 {{ $labels.model_instance_name }} 已加载"
+            description: "模型 {{ $labels.model_name }} 已使用 {{ $labels.runtime }} 加载到 {{ $labels.worker_name }}，GPUStack 已确认该模型处于运行状态。收到恢复通知表示实例已卸载、模型已停止或资源已释放。"
+
+        - alert: GPUStackRequestErrors
+          expr: |
+            sum by (worker_name, model_name, model_instance_name, finished_reason) (
+              increase(gpustack:request_success_total{finished_reason=~"error|abort"}[5m])
+            ) > 0
+          labels:
+            severity: warning
+            category: workload
+          annotations:
+            summary: "GPUStack 模型实例 {{ $labels.model_instance_name }} 出现请求失败"
+            description: "过去 5 分钟内有 {{ $value | printf \"%.0f\" }} 个请求以 {{ $labels.finished_reason }} 状态结束。"
+
+        - alert: GPUStackRequestQueueBacklog
+          expr: gpustack:num_requests_waiting > 0
+          for: 10m
+          labels:
+            severity: warning
+            category: workload
+          annotations:
+            summary: "模型实例 {{ $labels.model_instance_name }} 存在持续排队请求"
+            description: "{{ $labels.worker_name }} 上有 {{ $value | printf \"%.0f\" }} 个请求已持续排队 10 分钟。"
+
+        - alert: GPUStackUnattributedWorkerUse
+          expr: |
+            max by (worker_name, gpu_index, gpu_name) (
+              gpustack:worker_node_gpu_utilization_rate
+            ) > 20
+            unless on (worker_name)
+            count by (worker_name) (gpustack:num_requests_running)
+          for: 10m
+          labels:
+            severity: warning
+            category: ownership
+          annotations:
+            summary: "{{ $labels.worker_name }} 的 GPU 活动未关联 GPUStack 模型实例"
+            description: "GPU 利用率为 {{ $value | printf \"%.0f\" }}%。请检查 Kubernetes 归属标签和主机进程。"
+
+    - name: dcgm.hardware
+      rules:
+        - alert: DCGMExporterDown
+          expr: up{namespace="gpu-observability", service="dcgm-exporter"} == 0
+          for: 2m
+          labels:
+            severity: critical
+            category: availability
+          annotations:
+            summary: "{{ $labels.node }} 上的 DCGM Exporter 不可用"
+            description: "GPU 硬件错误和 Pod 归属指标已连续 2 分钟不可用。"
+
+        - alert: GPUXIDError
+          expr: |
+            increase(DCGM_EXP_XID_ERRORS_TOTAL[5m]) > 0
+            or DCGM_EXP_XID_ERRORS_COUNT > 0
+          labels:
+            severity: critical
+            category: hardware
+          annotations:
+            summary: "{{ $labels.node }} 的 GPU {{ $labels.gpu }} 出现 NVIDIA XID 错误"
+            description: "{{ $labels.modelName }}（{{ $labels.UUID }}）报告 XID {{ $labels.xid }}。恢复 GPU 使用前请检查内核和 DCGM 日志。"
+
+        - alert: GPUHealthWarning
+          expr: DCGM_EXP_GPU_HEALTH_STATUS > 0
+          for: 1m
+          labels:
+            severity: critical
+            category: hardware
+          annotations:
+            summary: "{{ $labels.node }} 的 DCGM 健康检查失败"
+            description: "检查项 {{ $labels.health_watch }} 返回状态 {{ $value }}，错误码为 {{ $labels.health_error_code }}。10 和 20 分别表示警告和失败。"
+
+        - alert: DCGMGPUHighTemperature
+          expr: DCGM_FI_DEV_GPU_TEMP > 85
+          for: 5m
+          labels:
+            severity: critical
+            category: hardware
+          annotations:
+            summary: "{{ $labels.node }} 的 GPU 温度超过 85 C"
+            description: "{{ $labels.modelName }} GPU {{ $labels.gpu }} 当前温度为 {{ $value | printf \"%.0f\" }} C。"
+
+        - alert: DCGMGPUMemoryNearlyFull
+          expr: |
+            100 * DCGM_FI_DEV_FB_USED
+              / clamp_min(DCGM_FI_DEV_FB_USED + DCGM_FI_DEV_FB_FREE, 1) > 95
+          for: 10m
+          labels:
+            severity: warning
+            category: capacity
+          annotations:
+            summary: "{{ $labels.node }} 的 GPU 显存接近耗尽"
+            description: "{{ $labels.modelName }} GPU {{ $labels.gpu }} 的显存使用率已连续 10 分钟超过 95%。"
+
+        - alert: GPUResourceInUse
+          expr: DCGM_FI_DEV_FB_USED{pod!="", namespace!=""} > 512
+          for: 1m
+          labels:
+            severity: info
+            category: resource_state
+            event: allocated
+          annotations:
+            summary: "GPU 正由 {{ $labels.namespace }}/{{ $labels.pod }} 使用"
+            description: "容器 {{ $labels.container }} 在 {{ $labels.node }} 的 GPU {{ $labels.gpu }} 上使用 {{ $value | printf \"%.0f\" }} MiB 显存。收到恢复通知表示该占用已结束。"
+
+        - alert: GPUHostUseUnattributed
+          expr: DCGM_FI_DEV_FB_USED{pod=""} > 512
+          for: 5m
+          labels:
+            severity: warning
+            category: ownership
+          annotations:
+            summary: "{{ $labels.node }} 的 GPU 占用未归属到 Pod"
+            description: "GPU {{ $labels.gpu }} 已使用 {{ $value | printf \"%.0f\" }} MiB 显存。请使用 nvidia-smi pmon 检查主机图形和计算进程。"
+
+        - alert: GPUAllocatedButIdle
+          expr: DCGM_FI_DEV_GPU_UTIL{pod!="", namespace!=""} < 5
+          for: 15m
+          labels:
+            severity: warning
+            category: efficiency
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }} 已分配的 GPU 长时间空闲"
+            description: "{{ $labels.node }} 的 GPU {{ $labels.gpu }} 已分配给 Pod，但利用率已连续 15 分钟低于 5%。"
+
+        - alert: GPUDoubleBitECCError
+          expr: increase(DCGM_FI_DEV_ECC_DBE_AGG_TOTAL[5m]) > 0
+          labels:
+            severity: critical
+            category: hardware
+          annotations:
+            summary: "{{ $labels.node }} 出现双比特 ECC 错误"
+            description: "GPU {{ $labels.gpu }} 报告不可纠正的持久 ECC 错误。请迁移工作负载并检查 GPU。"
+
+    - name: kubernetes.gpu-allocation
+      rules:
+        - alert: KubernetesGPUAllocationActive
+          expr: |
+            (
+              (
+                sum by (namespace, pod) (
+                  kube_pod_container_resource_requests{resource=~"nvidia(_com|\\.com)_gpu"} > 0
+                )
+                * on (namespace, pod) group_left (node)
+                max by (namespace, pod, node) (kube_pod_info{node!=""})
+              )
+              and on (namespace, pod)
+              max by (namespace, pod) (kube_pod_status_phase{phase="Running"} == 1)
+            )
+            * on (namespace, pod) group_left (
+              label_observability_gpustack_io_owner,
+              label_observability_gpustack_io_team,
+              label_observability_gpustack_io_project,
+              label_observability_gpustack_io_task
+            )
+            max by (
+              namespace,
+              pod,
+              label_observability_gpustack_io_owner,
+              label_observability_gpustack_io_team,
+              label_observability_gpustack_io_project,
+              label_observability_gpustack_io_task
+            ) (kube_pod_labels) > 0
+          for: 1m
+          labels:
+            severity: info
+            category: resource_state
+            event: allocated
+          annotations:
+            summary: "{{ $labels.namespace }}/{{ $labels.pod }} 的 Kubernetes GPU 分配已生效"
+            description: "负责人={{ $labels.label_observability_gpustack_io_owner }}，项目={{ $labels.label_observability_gpustack_io_project }}，任务={{ $labels.label_observability_gpustack_io_task }}，节点={{ $labels.node }}。收到恢复通知表示 Pod 已停止或分配已释放。"
+
+    - name: kueue.workloads
+      rules:
+        - alert: KueueMetricsMissing
+          expr: absent(kueue_build_info)
+          for: 10m
+          labels:
+            severity: warning
+            category: availability
+          annotations:
+            summary: "Kueue 指标缺失"
+            description: "Prometheus 已连续 10 分钟未收到 Kueue 构建信息。请检查 Kueue ServiceMonitor 和 TLS 配置。"
+
+        - alert: KueueWorkloadsPending
+          expr: sum by (cluster_queue, status) (kueue_pending_workloads) > 0
+          for: 15m
+          labels:
+            severity: warning
+            category: scheduling
+          annotations:
+            summary: "Kueue 工作负载已排队 15 分钟"
+            description: "ClusterQueue {{ $labels.cluster_queue }} 中有 {{ $value | printf \"%.0f\" }} 个状态为 {{ $labels.status }} 的排队工作负载。"
+
+        - alert: KueueWorkloadEvicted
+          expr: sum by (cluster_queue, reason, underlying_cause) (increase(kueue_evicted_workloads_total[5m])) > 0
+          labels:
+            severity: warning
+            category: scheduling
+          annotations:
+            summary: "Kueue 从 {{ $labels.cluster_queue }} 驱逐了工作负载"
+            description: "原因={{ $labels.reason }}，底层原因={{ $labels.underlying_cause }}，数量={{ $value | printf \"%.0f\" }}。"
+
+    - name: gpu.processes
+      rules:
+        - alert: GPUProcessExporterDown
+          expr: |
+            min by (node) (up{job="gpu-process-exporter"}) == 0
+            or gpu_process_exporter_scrape_success == 0
+          for: 2m
+          labels:
+            severity: critical
+            category: availability
+          annotations:
+            summary: "{{ $labels.node }} 的 GPU 进程采集器不可用"
+            description: "无法可靠读取 NVIDIA 计算进程。请检查 gpu-process-exporter Pod、NVIDIA Runtime 和 nvidia-smi。"
+
+        - alert: GPUProcessStarted
+          expr: max_over_time(gpu_process_used_memory_mib{scope="host"}[1m]) >= 0
+          for: 30s
+          labels:
+            severity: info
+            category: resource_state
+            event: started
+          annotations:
+            summary: "用户 {{ $labels.owner }} 的 GPU 任务进程 {{ $labels.task }} 已开始运行"
+            description: "节点={{ $labels.node }}，PID={{ $labels.pid }}，进程={{ $labels.process }}，当前使用显存={{ $value | printf \"%.0f\" }} MiB。收到恢复通知表示该进程已结束。"
+
+        - alert: GPUProcessLongRunning
+          expr: time() - max_over_time(gpu_process_start_time_seconds{scope="host"}[1m]) > 18000
+          for: 1m
+          labels:
+            severity: warning
+            category: workload
+            event: long_running
+          annotations:
+            summary: "用户 {{ $labels.owner }} 的 GPU 任务进程 {{ $labels.task }} 已运行超过 5 小时"
+            description: "节点={{ $labels.node }}，PID={{ $labels.pid }}，进程={{ $labels.process }}。请确认长时间运行是否符合预期。"
+
+    - name: training.progress
+      rules:
+        - record: gpu_training_progress_percent
+          expr: |
+            100
+            * max by (namespace, pod, owner, team, project, task) (training_current_step)
+            / clamp_min(
+                max by (namespace, pod, owner, team, project, task) (training_total_steps),
+                1
+              )
+
+        - alert: GPUTrainingStalled
+          expr: |
+            training_current_step
+              < on (namespace, pod, owner, project, task) training_total_steps
+            and on (namespace, pod, owner, project, task)
+              changes(training_current_step[15m]) == 0
+          for: 15m
+          labels:
+            severity: warning
+            category: workload
+          annotations:
+            summary: "训练任务 {{ $labels.task }} 已停止推进"
+            description: "负责人={{ $labels.owner }}，项目={{ $labels.project }}，Pod={{ $labels.namespace }}/{{ $labels.pod }}。当前步数已连续 30 分钟未变化。"
+
+        - alert: GPUTrainingCompleted
+          expr: |
+            training_current_step
+              >= on (namespace, pod, owner, project, task) training_total_steps
+          for: 1m
+          labels:
+            severity: info
+            category: workload
+            event: completed
+          annotations:
+            summary: "训练任务 {{ $labels.task }} 已完成"
+            description: "负责人={{ $labels.owner }}，项目={{ $labels.project }}，Pod={{ $labels.namespace }}/{{ $labels.pod }} 已达到总训练步数。"

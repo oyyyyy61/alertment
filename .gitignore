@@ -1,0 +1,15 @@
+# 凭证与本地环境，绝不入库
+*.kubeconfig
+.kube/
+kubeconfig*
+*.conf.bak
+
+# Helm 离线包与运行产物
+*.tgz
+__pycache__/
+*.pyc
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store

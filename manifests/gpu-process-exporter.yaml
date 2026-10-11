@@ -1,0 +1,439 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-process-exporter
+  namespace: gpu-observability
+  labels:
+    app.kubernetes.io/name: gpu-process-exporter
+    app.kubernetes.io/part-of: gpu-observability
+data:
+  exporter.py: |
+    import csv
+    import os
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from pathlib import Path
+
+    LISTEN_PORT = 9500
+    CACHE_TTL_SECONDS = 60
+    NODE_NAME = os.environ.get("NODE_NAME", "unknown")
+    CACHE = {"lines": [], "last_success": 0.0}
+
+
+    def prometheus_escape(value):
+        return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+    def label_set(labels):
+        return ",".join(
+            f'{key}="{prometheus_escape(value)}"'
+            for key, value in sorted(labels.items())
+        )
+
+
+    def snapshot_rows(path):
+        return [
+            [column.strip() for column in row]
+            for row in csv.reader(Path(path).read_text().splitlines())
+            if row
+        ]
+
+
+    def nvidia_snapshot():
+        if Path("/shared/writing").read_text().strip() != "0":
+            raise OSError("NVIDIA snapshot update is in progress")
+        if Path("/shared/success").read_text().strip() != "1":
+            raise OSError("NVIDIA snapshot collector reported a failure")
+        return snapshot_rows("/shared/gpus.csv"), snapshot_rows(
+            "/shared/processes.csv"
+        )
+
+
+    def host_users():
+        users = {}
+        try:
+            for line in Path("/host/etc/passwd").read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines():
+                fields = line.split(":")
+                if len(fields) >= 3:
+                    users[int(fields[2])] = fields[0]
+        except (OSError, ValueError):
+            pass
+        return users
+
+
+    def process_uid(pid):
+        try:
+            for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+                if line.startswith("Uid:"):
+                    return int(line.split()[1])
+        except (OSError, ValueError, IndexError):
+            pass
+        return -1
+
+
+    def process_start_time(pid):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            fields = stat[stat.rfind(")") + 2 :].split()
+            start_ticks = int(fields[19])
+            uptime = float(Path("/proc/uptime").read_text().split()[0])
+            boot_time = time.time() - uptime
+            return boot_time + start_ticks / os.sysconf("SC_CLK_TCK")
+        except (OSError, ValueError, IndexError):
+            return 0.0
+
+
+    def process_arguments(pid):
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+            return [
+                value.decode("utf-8", errors="replace")
+                for value in raw.split(b"\0")
+                if value
+            ]
+        except OSError:
+            return []
+
+
+    def process_scope(pid):
+        try:
+            cgroup = Path(f"/proc/{pid}/cgroup").read_text().lower()
+        except OSError:
+            return "unknown"
+        if "kubepods" in cgroup or "cri-containerd" in cgroup:
+            return "kubernetes"
+        return "host"
+
+
+    def compact_label(value, maximum=120):
+        cleaned = " ".join(str(value).split())
+        return cleaned[:maximum] or "unknown"
+
+
+    def task_name(arguments, process_path):
+        process = os.path.basename(process_path) or "unknown"
+        if not arguments:
+            return compact_label(process)
+
+        executable = os.path.basename(arguments[0])
+        if executable.startswith("python"):
+            for index, argument in enumerate(arguments[1:], start=1):
+                if argument == "-m" and index + 1 < len(arguments):
+                    return compact_label(arguments[index + 1])
+                if argument.endswith(".py"):
+                    return compact_label(os.path.basename(argument))
+            return compact_label(process)
+
+        return compact_label(executable or process)
+
+
+    def collect_process_metrics():
+        gpu_rows, process_rows = nvidia_snapshot()
+        gpu_indexes = {
+            uuid: index
+            for index, uuid in gpu_rows
+        }
+        users = host_users()
+        now = time.time()
+        lines = [
+            "# HELP gpu_process_info Active NVIDIA compute process information.",
+            "# TYPE gpu_process_info gauge",
+            "# HELP gpu_process_start_time_seconds Process start time since Unix epoch.",
+            "# TYPE gpu_process_start_time_seconds gauge",
+            "# HELP gpu_process_elapsed_seconds Current process runtime in seconds.",
+            "# TYPE gpu_process_elapsed_seconds gauge",
+            "# HELP gpu_process_used_memory_mib GPU framebuffer memory used by the process in MiB.",
+            "# TYPE gpu_process_used_memory_mib gauge",
+        ]
+
+        for pid_text, process_path, memory_text, gpu_uuid in process_rows:
+            try:
+                pid = int(pid_text)
+                used_memory = float(memory_text)
+            except ValueError:
+                continue
+
+            uid = process_uid(pid)
+            owner = users.get(uid, f"uid-{uid}" if uid >= 0 else "unknown")
+            arguments = process_arguments(pid)
+            started_at = process_start_time(pid)
+            labels = {
+                "node": NODE_NAME,
+                "gpu": gpu_indexes.get(gpu_uuid, "unknown"),
+                "gpu_uuid": gpu_uuid,
+                "pid": str(pid),
+                "process_start_unix": str(int(started_at)) if started_at > 0 else "0",
+                "owner": compact_label(owner, 64),
+                "process": compact_label(os.path.basename(process_path), 80),
+                "task": task_name(arguments, process_path),
+                "scope": process_scope(pid),
+            }
+            rendered = label_set(labels)
+            lines.append(f"gpu_process_info{{{rendered}}} 1")
+            lines.append(
+                f"gpu_process_start_time_seconds{{{rendered}}} {started_at:.3f}"
+            )
+            lines.append(
+                f"gpu_process_elapsed_seconds{{{rendered}}} {max(0, now - started_at):.3f}"
+            )
+            lines.append(
+                f"gpu_process_used_memory_mib{{{rendered}}} {used_memory:.3f}"
+            )
+
+        return lines
+
+
+    def metrics_payload():
+        now = time.time()
+        try:
+            lines = collect_process_metrics()
+            CACHE["lines"] = lines
+            CACHE["last_success"] = now
+            success = 1
+        except (OSError, ValueError) as error:
+            if CACHE["lines"] and now - CACHE["last_success"] <= CACHE_TTL_SECONDS:
+                lines = CACHE["lines"]
+                success = 1
+            else:
+                lines = []
+                success = 0
+                print(
+                    f"NVIDIA process collection failed: {type(error).__name__}: {error}",
+                    flush=True,
+                )
+
+        lines = list(lines)
+        lines.extend(
+            [
+                "# HELP gpu_process_exporter_scrape_success Whether the latest NVIDIA process collection succeeded.",
+                "# TYPE gpu_process_exporter_scrape_success gauge",
+                f'gpu_process_exporter_scrape_success{{node="{prometheus_escape(NODE_NAME)}"}} {success}',
+            ]
+        )
+        return "\n".join(lines) + "\n"
+
+
+    class Handler(BaseHTTPRequestHandler):
+        def send_text(self, status, text, content_type="text/plain; charset=utf-8"):
+            body = text.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == "/healthz":
+                self.send_text(200, "ok\n")
+                return
+            if self.path == "/readyz":
+                try:
+                    nvidia_snapshot()
+                    self.send_text(200, "ok\n")
+                except (OSError, ValueError):
+                    self.send_text(503, "not ready\n")
+                return
+            if self.path == "/metrics":
+                self.send_text(200, metrics_payload(), "text/plain; version=0.0.4")
+                return
+            self.send_text(404, "not found\n")
+
+        def log_message(self, format_string, *args):
+            return
+
+
+    if __name__ == "__main__":
+        ThreadingHTTPServer(("0.0.0.0", LISTEN_PORT), Handler).serve_forever()
+  collector.sh: |
+    #!/usr/bin/bash
+    set -u
+
+    while :; do
+      printf '1\n' > /shared/writing
+      if /usr/bin/nvidia-smi \
+        --query-gpu=index,uuid \
+        --format=csv,noheader,nounits > /shared/gpus.csv \
+        && /usr/bin/nvidia-smi \
+          --query-compute-apps=pid,process_name,used_gpu_memory,gpu_uuid \
+          --format=csv,noheader,nounits > /shared/processes.csv; then
+        printf '1\n' > /shared/success
+      else
+        printf '0\n' > /shared/success
+      fi
+      printf '0\n' > /shared/writing
+      /usr/bin/sleep 10
+    done
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gpu-process-exporter
+  namespace: gpu-observability
+  labels:
+    app.kubernetes.io/name: gpu-process-exporter
+    app.kubernetes.io/part-of: gpu-observability
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gpu-process-exporter
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gpu-process-exporter
+        app.kubernetes.io/part-of: gpu-observability
+    spec:
+      hostPID: true
+      runtimeClassName: nvidia
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: In
+                    values:
+                      - gpu-node-14
+                      - gpu-node-15
+      containers:
+        - name: nvidia-collector
+          image: nvcr.io/nvidia/k8s/dcgm-exporter:4.6.1-4.8.4-distroless
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/bin/bash
+            - /app/collector.sh
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,utility
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: application
+              mountPath: /app
+              readOnly: true
+            - name: snapshots
+              mountPath: /shared
+        - name: exporter
+          image: python:3.12-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - /app/exporter.py
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          ports:
+            - name: metrics
+              containerPort: 9500
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: metrics
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: application
+              mountPath: /app
+              readOnly: true
+            - name: host-passwd
+              mountPath: /host/etc/passwd
+              readOnly: true
+            - name: snapshots
+              mountPath: /shared
+      volumes:
+        - name: application
+          configMap:
+            name: gpu-process-exporter
+        - name: host-passwd
+          hostPath:
+            path: /etc/passwd
+            type: File
+        - name: snapshots
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gpu-process-exporter
+  namespace: gpu-observability
+  labels:
+    app.kubernetes.io/name: gpu-process-exporter
+    app.kubernetes.io/part-of: gpu-observability
+spec:
+  selector:
+    app.kubernetes.io/name: gpu-process-exporter
+  ports:
+    - name: metrics
+      port: 9500
+      targetPort: metrics
+      protocol: TCP
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: gpu-process-exporter
+  namespace: gpu-observability
+  labels:
+    app.kubernetes.io/name: gpu-process-exporter
+    app.kubernetes.io/part-of: gpu-observability
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gpu-process-exporter
+  namespaceSelector:
+    matchNames:
+      - gpu-observability
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels:
+            - __meta_kubernetes_pod_node_name
+          targetLabel: node
+      metricRelabelings:
+        - action: labeldrop
+          regex: container|endpoint|exported_node|instance|job|namespace|pod|service

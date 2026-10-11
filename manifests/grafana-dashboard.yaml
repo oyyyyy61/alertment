@@ -1,0 +1,526 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-resource-overview-dashboard
+  namespace: gpu-observability
+  labels:
+    grafana_dashboard: "1"
+    app.kubernetes.io/part-of: gpu-observability
+data:
+  gpu-resource-overview.json: |-
+    {
+      "annotations": {
+        "list": [
+          {
+            "builtIn": 1,
+            "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+            "enable": true,
+            "hide": true,
+            "iconColor": "rgba(0, 211, 255, 1)",
+            "name": "Annotations & Alerts",
+            "type": "dashboard"
+          }
+        ]
+      },
+      "editable": true,
+      "graphTooltip": 1,
+      "id": null,
+      "links": [],
+      "liveNow": false,
+      "panels": [
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "max": 100,
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {"color": "green", "value": null},
+                  {"color": "yellow", "value": 70},
+                  {"color": "red", "value": 90}
+                ]
+              },
+              "unit": "percent"
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 5, "w": 8, "x": 0, "y": 0},
+          "id": 1,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "horizontal",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "auto"
+          },
+          "targets": [
+            {
+              "expr": "gpustack:worker_node_gpu_utilization_rate{worker_name=~\"$worker\"}",
+              "legendFormat": "{{worker_name}} GPU{{gpu_index}}",
+              "refId": "A"
+            }
+          ],
+          "title": "GPU utilization",
+          "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "max": 100,
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {"color": "green", "value": null},
+                  {"color": "yellow", "value": 80},
+                  {"color": "red", "value": 95}
+                ]
+              },
+              "unit": "percent"
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 5, "w": 8, "x": 8, "y": 0},
+          "id": 2,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "horizontal",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "auto"
+          },
+          "targets": [
+            {
+              "expr": "gpustack:worker_node_gram_utilization_rate{worker_name=~\"$worker\"}",
+              "legendFormat": "{{worker_name}} GPU{{gpu_index}}",
+              "refId": "A"
+            }
+          ],
+          "title": "GPU memory utilization",
+          "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "thresholds"},
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {"color": "green", "value": null},
+                  {"color": "yellow", "value": 75},
+                  {"color": "red", "value": 85}
+                ]
+              },
+              "unit": "celsius"
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 5, "w": 8, "x": 16, "y": 0},
+          "id": 3,
+          "options": {
+            "colorMode": "value",
+            "graphMode": "area",
+            "justifyMode": "auto",
+            "orientation": "horizontal",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "textMode": "auto"
+          },
+          "targets": [
+            {
+              "expr": "gpustack:worker_node_gpu_temperature_celsius{worker_name=~\"$worker\"}",
+              "legendFormat": "{{worker_name}} GPU{{gpu_index}}",
+              "refId": "A"
+            }
+          ],
+          "title": "GPU temperature",
+          "type": "stat"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "drawStyle": "line",
+                "fillOpacity": 15,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {"group": "A", "mode": "none"}
+              },
+              "max": 100,
+              "min": 0,
+              "unit": "percent"
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 5},
+          "id": 4,
+          "options": {
+            "legend": {"calcs": ["lastNotNull", "mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+            "tooltip": {"mode": "multi", "sort": "desc"}
+          },
+          "targets": [
+            {
+              "expr": "gpustack:worker_node_gpu_utilization_rate{worker_name=~\"$worker\"}",
+              "legendFormat": "{{worker_name}} GPU{{gpu_index}}",
+              "refId": "A"
+            }
+          ],
+          "title": "GPU utilization history",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "drawStyle": "line",
+                "fillOpacity": 15,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {"group": "A", "mode": "none"}
+              },
+              "max": 100,
+              "min": 0,
+              "unit": "percent"
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 5},
+          "id": 5,
+          "options": {
+            "legend": {"calcs": ["lastNotNull", "mean", "max"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+            "tooltip": {"mode": "multi", "sort": "desc"}
+          },
+          "targets": [
+            {
+              "expr": "gpustack:worker_node_gram_utilization_rate{worker_name=~\"$worker\"}",
+              "legendFormat": "{{worker_name}} GPU{{gpu_index}}",
+              "refId": "A"
+            }
+          ],
+          "title": "GPU memory history",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "fieldConfig": {"defaults": {}, "overrides": []},
+          "gridPos": {"h": 7, "w": 12, "x": 0, "y": 13},
+          "id": 6,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false},
+            "showHeader": true
+          },
+          "targets": [
+            {
+              "expr": "count by (worker_name, model_name, model_instance_name, runtime) (gpustack:num_requests_running{worker_name=~\"$worker\"})",
+              "format": "table",
+              "instant": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Loaded GPUStack model instances",
+          "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true}}}],
+          "type": "table"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "requests",
+                "axisPlacement": "auto",
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {"group": "A", "mode": "none"}
+              }
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 7, "w": 12, "x": 12, "y": 13},
+          "id": 7,
+          "options": {
+            "legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+            "tooltip": {"mode": "multi", "sort": "desc"}
+          },
+          "targets": [
+            {
+              "expr": "sum by (model_instance_name) (gpustack:num_requests_running{worker_name=~\"$worker\"})",
+              "legendFormat": "{{model_instance_name}} running",
+              "refId": "A"
+            },
+            {
+              "expr": "sum by (model_instance_name) (gpustack:num_requests_waiting{worker_name=~\"$worker\"})",
+              "legendFormat": "{{model_instance_name}} waiting",
+              "refId": "B"
+            }
+          ],
+          "title": "Inference requests",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "tokens/s",
+                "axisPlacement": "auto",
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {"group": "A", "mode": "none"}
+              },
+              "unit": "ops"
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 7, "w": 12, "x": 0, "y": 20},
+          "id": 8,
+          "options": {
+            "legend": {"calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+            "tooltip": {"mode": "multi", "sort": "desc"}
+          },
+          "targets": [
+            {
+              "expr": "sum by (model_instance_name) (rate(gpustack:prompt_tokens_total{worker_name=~\"$worker\"}[5m]))",
+              "legendFormat": "{{model_instance_name}} input",
+              "refId": "A"
+            },
+            {
+              "expr": "sum by (model_instance_name) (rate(gpustack:generation_tokens_total{worker_name=~\"$worker\"}[5m]))",
+              "legendFormat": "{{model_instance_name}} output",
+              "refId": "B"
+            }
+          ],
+          "title": "Token throughput",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "fieldConfig": {"defaults": {}, "overrides": []},
+          "gridPos": {"h": 7, "w": 12, "x": 12, "y": 20},
+          "id": 9,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false},
+            "showHeader": true
+          },
+          "targets": [
+            {
+              "expr": "sum by (namespace, pod, node) (kube_pod_container_resource_requests{resource=~\"nvidia(_com|\\.com)_gpu\"}) * on (namespace, pod) group_left (node) max by (namespace, pod, node) (kube_pod_info{node!=\"\"})",
+              "format": "table",
+              "instant": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Kubernetes GPU requests",
+          "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true}}}],
+          "type": "table"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "palette-classic"},
+              "custom": {
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "workloads",
+                "axisPlacement": "auto",
+                "drawStyle": "line",
+                "fillOpacity": 15,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {"group": "A", "mode": "normal"}
+              }
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 7, "w": 12, "x": 0, "y": 27},
+          "id": 10,
+          "options": {
+            "legend": {"calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom", "showLegend": true},
+            "tooltip": {"mode": "multi", "sort": "desc"}
+          },
+          "targets": [
+            {
+              "expr": "sum by (cluster_queue, status) (kueue_pending_workloads)",
+              "legendFormat": "{{cluster_queue}} {{status}} pending",
+              "refId": "A"
+            },
+            {
+              "expr": "sum by (cluster_queue) (kueue_admitted_active_workloads)",
+              "legendFormat": "{{cluster_queue}} active",
+              "refId": "B"
+            }
+          ],
+          "title": "Kueue workload state",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "fieldConfig": {
+            "defaults": {
+              "color": {"mode": "continuous-GrYlRd"},
+              "max": 100,
+              "min": 0,
+              "unit": "percent"
+            },
+            "overrides": []
+          },
+          "gridPos": {"h": 7, "w": 12, "x": 12, "y": 27},
+          "id": 11,
+          "options": {
+            "displayMode": "gradient",
+            "legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": false},
+            "maxVizHeight": 300,
+            "minVizHeight": 10,
+            "minVizWidth": 0,
+            "namePlacement": "auto",
+            "orientation": "horizontal",
+            "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+            "showUnfilled": true,
+            "sizing": "auto",
+            "valueMode": "color"
+          },
+          "targets": [
+            {
+              "expr": "gpu_training_progress_percent",
+              "legendFormat": "{{owner}} / {{project}} / {{task}}",
+              "refId": "A"
+            }
+          ],
+          "title": "Training progress",
+          "type": "bargauge"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "fieldConfig": {"defaults": {}, "overrides": []},
+          "gridPos": {"h": 7, "w": 24, "x": 0, "y": 34},
+          "id": 13,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false},
+            "showHeader": true
+          },
+          "targets": [
+            {
+              "expr": "gpu_process_used_memory_mib{scope=\"host\",node=~\"$worker\"}",
+              "format": "table",
+              "instant": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Host GPU task processes (memory MiB)",
+          "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true}}}],
+          "type": "table"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "fieldConfig": {"defaults": {}, "overrides": []},
+          "gridPos": {"h": 8, "w": 24, "x": 0, "y": 41},
+          "id": 12,
+          "options": {
+            "cellHeight": "sm",
+            "footer": {"countRows": false, "fields": "", "reducer": ["sum"], "show": false},
+            "showHeader": true
+          },
+          "targets": [
+            {
+              "expr": "ALERTS{alertstate=\"firing\", alertname=~\"GPU.*|DCGM.*|Kueue.*\"}",
+              "format": "table",
+              "instant": true,
+              "refId": "A"
+            }
+          ],
+          "title": "Active GPU and queue alerts",
+          "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true}}}],
+          "type": "table"
+        }
+      ],
+      "refresh": "15s",
+      "schemaVersion": 39,
+      "tags": ["gpustack", "gpu", "kueue"],
+      "templating": {
+        "list": [
+          {
+            "current": {},
+            "hide": 0,
+            "includeAll": false,
+            "label": "Prometheus",
+            "name": "DS_PROMETHEUS",
+            "options": [],
+            "query": "prometheus",
+            "refresh": 1,
+            "regex": "",
+            "type": "datasource"
+          },
+          {
+            "allValue": ".*",
+            "current": {"selected": false, "text": "All", "value": "$__all"},
+            "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+            "definition": "label_values(gpustack:worker_node_gpu_utilization_rate, worker_name)",
+            "hide": 0,
+            "includeAll": true,
+            "label": "Worker",
+            "multi": true,
+            "name": "worker",
+            "options": [],
+            "query": {"query": "label_values(gpustack:worker_node_gpu_utilization_rate, worker_name)", "refId": "StandardVariableQuery"},
+            "refresh": 1,
+            "regex": "",
+            "sort": 1,
+            "type": "query"
+          }
+        ]
+      },
+      "time": {"from": "now-6h", "to": "now"},
+      "timepicker": {},
+      "timezone": "browser",
+      "title": "GPUStack GPU Resource Overview",
+      "uid": "gpustack-gpu-resource",
+      "version": 1,
+      "weekStart": ""
+    }

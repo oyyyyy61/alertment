@@ -1,0 +1,124 @@
+fullnameOverride: kube-prometheus-stack
+
+# RKE2 binds these component metrics to loopback by default. Disable the
+# unreachable stock targets so they do not generate permanent TargetDown noise.
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+prometheus:
+  prometheusSpec:
+    nodeSelector:
+      node-role.kubernetes.io/control-plane: "true"
+    scrapeInterval: 15s
+    evaluationInterval: 15s
+    retention: 30d
+    retentionSize: 80GB
+    externalLabels:
+      cluster: gpustack-rke2
+    serviceMonitorSelectorNilUsesHelmValues: false
+    serviceMonitorNamespaceSelector: {}
+    podMonitorSelectorNilUsesHelmValues: false
+    podMonitorNamespaceSelector: {}
+    scrapeConfigSelectorNilUsesHelmValues: false
+    scrapeConfigSelector: {}
+    scrapeConfigNamespaceSelector: {}
+    ruleSelectorNilUsesHelmValues: false
+    ruleNamespaceSelector: {}
+    resources:
+      requests:
+        cpu: 500m
+        memory: 2Gi
+      limits:
+        cpu: "2"
+        memory: 6Gi
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: longhorn
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 100Gi
+
+alertmanager:
+  enabled: true
+  alertmanagerSpec:
+    nodeSelector:
+      node-role.kubernetes.io/control-plane: "true"
+    alertmanagerConfigMatcherStrategy:
+      type: None
+    alertmanagerConfigSelector:
+      matchLabels:
+        observability.gpustack.io/receiver: gpu-alerts
+    alertmanagerConfigNamespaceSelector: {}
+    resources:
+      requests:
+        cpu: 100m
+        memory: 256Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: longhorn
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 5Gi
+
+grafana:
+  enabled: true
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  admin:
+    existingSecret: gpu-grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+  persistence:
+    enabled: true
+    storageClassName: longhorn
+    accessModes:
+      - ReadWriteOnce
+    size: 10Gi
+  sidecar:
+    dashboards:
+      enabled: true
+      searchNamespace: ALL
+      label: grafana_dashboard
+      labelValue: "1"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+
+kube-state-metrics:
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+  image:
+    registry: m.daocloud.io
+    repository: registry.k8s.io/kube-state-metrics/kube-state-metrics
+    tag: v2.20.0
+    sha: sha256:01171220c7c059afc85034ffe687bfe7249e41c0cc46fbe9a5128503ceee3016
+  metricLabelsAllowlist:
+    - pods=[observability.gpustack.io/owner,observability.gpustack.io/team,observability.gpustack.io/project,observability.gpustack.io/task,kueue.x-k8s.io/queue-name]
+
+prometheus-node-exporter:
+  enabled: true
+  service:
+    listenOnAllInterfaces: false
+
+prometheusOperator:
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"

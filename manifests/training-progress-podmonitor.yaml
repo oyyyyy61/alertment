@@ -1,0 +1,31 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: gpu-training-progress
+  namespace: gpu-observability
+  labels:
+    app.kubernetes.io/part-of: gpu-observability
+spec:
+  namespaceSelector:
+    any: true
+  selector:
+    matchLabels:
+      observability.gpustack.io/progress: "true"
+  podMetricsEndpoints:
+    - port: metrics
+      path: /metrics
+      interval: 15s
+      scrapeTimeout: 10s
+      relabelings:
+        - sourceLabels:
+            - __meta_kubernetes_pod_label_observability_gpustack_io_owner
+          targetLabel: owner
+        - sourceLabels:
+            - __meta_kubernetes_pod_label_observability_gpustack_io_team
+          targetLabel: team
+        - sourceLabels:
+            - __meta_kubernetes_pod_label_observability_gpustack_io_project
+          targetLabel: project
+        - sourceLabels:
+            - __meta_kubernetes_pod_label_observability_gpustack_io_task
+          targetLabel: task
